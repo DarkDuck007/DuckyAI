@@ -6,8 +6,11 @@ from typing import Optional
 from config import config
 from db_manager import DatabaseManager
 from ai_agent import AIAgent
+from message_utils import split_message
 
 logger = logging.getLogger(__name__)
+
+MAX_BALE_MESSAGE_LENGTH = 2800
 
 class BaleBot:
     def __init__(self, db_manager: DatabaseManager, ai_agent: AIAgent):
@@ -76,6 +79,11 @@ class BaleBot:
         except Exception as e:
             logger.error(f"Error sending message to {chat_id}: {e}")
 
+    async def send_ai_response(self, chat_id: int, text: str):
+        """Sends an AI response, splitting it into Bale-safe chunks when needed."""
+        for chunk in split_message(text, MAX_BALE_MESSAGE_LENGTH):
+            await self.send_message(chat_id, chunk)
+
     async def handle_update(self, update: dict):
         """Processes a single update."""
         if "message" not in update:
@@ -109,7 +117,7 @@ class BaleBot:
         try:
             # Get AI response
             response_text = await self.agent.chat(active_session, text)
-            await self.send_message(chat_id, response_text)
+            await self.send_ai_response(chat_id, response_text)
         except Exception as e:
             logger.error(f"AI Agent error: {e}")
             await self.send_message(chat_id, "Sorry, I encountered an error processing your request.")
