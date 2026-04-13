@@ -1,10 +1,15 @@
 import sqlite3
 import uuid
 import logging
+from contextlib import contextmanager
 from datetime import datetime
 from config import config
 
 logger = logging.getLogger(__name__)
+
+def current_timestamp():
+    return datetime.now().isoformat(timespec="seconds")
+
 
 class DatabaseManager:
     def __init__(self, main_db=config.MAIN_DB, storage_db=config.STORAGE_DB):
@@ -12,14 +17,21 @@ class DatabaseManager:
         self.storage_db = storage_db
         self._init_db()
 
+    @contextmanager
     def get_connection(self):
         """Returns a configured SQLite connection with WAL and the attached storage DB."""
         conn = sqlite3.connect(self.main_db, check_same_thread=False)
-        # Enable Write-Ahead Logging for better concurrency
-        conn.execute("PRAGMA journal_mode=WAL")
-        # Attach the storage database for large blobs
-        conn.execute(f"ATTACH DATABASE '{self.storage_db}' AS storage")
-        return conn
+        try:
+            # Enable Write-Ahead Logging for better concurrency
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Attach the storage database for large blobs
+            conn.execute(f"ATTACH DATABASE '{self.storage_db}' AS storage")
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_db(self):
         try:
@@ -49,6 +61,14 @@ class DatabaseManager:
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS storage.session_context (
+                        session_id TEXT PRIMARY KEY,
+                        summary TEXT NOT NULL DEFAULT '',
+                        summarized_message_id INTEGER NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
                 # Create index separately
                 conn.execute("CREATE INDEX IF NOT EXISTS storage.msg_session_idx ON message_store (session_id)")
                 conn.commit()
@@ -68,7 +88,7 @@ class DatabaseManager:
                 conn.execute("INSERT INTO users (chat_id, active_session_id) VALUES (?, ?)", (chat_id, session_id))
                 conn.execute(
                     "INSERT INTO sessions (session_id, chat_id, session_name, created_at) VALUES (?, ?, ?, ?)",
-                    (session_id, chat_id, "Default Session", datetime.now())
+                    (session_id, chat_id, "Default Session", current_timestamp())
                 )
                 conn.commit()
                 return session_id
@@ -94,7 +114,7 @@ class DatabaseManager:
         with self.get_connection() as conn:
             conn.execute(
                 "INSERT INTO sessions (session_id, chat_id, session_name, created_at) VALUES (?, ?, ?, ?)",
-                (session_id, chat_id, name, datetime.now())
+                (session_id, chat_id, name, current_timestamp())
             )
             # Ensure the user exists, if they don't, this update will do nothing unless user exists.
             # Best practice: insert or ignore first
@@ -117,9 +137,79 @@ class DatabaseManager:
         with self.get_connection() as conn:
             # Delete messages first from attached db
             conn.execute("DELETE FROM storage.message_store WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM storage.session_context WHERE session_id = ?", (session_id,))
             # Delete session metadata
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
             # If the deleted session was the active one, we should probably handle it,
             # but for simplicity we let the bot handle assigning a new one or the user creating one.
             conn.execute("UPDATE users SET active_session_id = NULL WHERE active_session_id = ?", (session_id,))
             conn.commit()
+
+    def get_session_summary(self, session_id: str):
+        """Returns compact long-term context and the newest summarized message id."""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT summary, summarized_message_id
+                FROM storage.session_context
+                WHERE session_id = ?
+                """,
+                (session_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return "", 0
+            return row[0] or "", row[1] or 0
+
+    def upsert_session_summary(self, session_id: str, summary: str, summarized_message_id: int):
+        """Stores compact context for messages up to summarized_message_id."""
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO storage.session_context
+                    (session_id, summary, summarized_message_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    summary = excluded.summary,
+                    summarized_message_id = excluded.summarized_message_id,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, summary, summarized_message_id, current_timestamp())
+            )
+            conn.commit()
+
+    def get_message_rows_after(self, session_id: str, message_id: int):
+        """Returns stored message rows newer than message_id in chronological order."""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT id, message
+                FROM storage.message_store
+                WHERE session_id = ? AND id > ?
+                ORDER BY id ASC
+                """,
+                (session_id, message_id)
+            )
+            return cursor.fetchall()
+
+    def get_recent_message_rows_after(self, session_id: str, message_id: int, limit: int):
+        """Returns the newest message rows after message_id in chronological order."""
+        if limit <= 0:
+            return []
+
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT id, message
+                FROM (
+                    SELECT id, message
+                    FROM storage.message_store
+                    WHERE session_id = ? AND id > ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (session_id, message_id, limit)
+            )
+            return cursor.fetchall()
